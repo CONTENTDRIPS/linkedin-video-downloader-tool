@@ -22,6 +22,7 @@ export class VideoNotFoundError extends Error {
  */
 export function extractVideoUrl(html: string): ExtractedVideo {
   const strategies = [
+    extractFromVideoDataSources,
     extractFromOgTags,
     extractFromEmbeddedJson,
     extractFromRawHlsOrMp4Scan,
@@ -48,8 +49,60 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&gt;/g, ">");
 }
 
+type VideoSource = {
+  src?: string;
+  type?: string;
+  "data-bitrate"?: number;
+};
+
 /**
- * Strategy 1: standard OpenGraph video meta tags. LinkedIn sometimes
+ * Strategy 1: LinkedIn's native video player renders a `data-sources`
+ * attribute on the `<video>` element — an HTML-entity-encoded JSON array of
+ * `{ src, type, "data-bitrate" }` renditions, e.g.:
+ *   data-sources="[{&quot;src&quot;:&quot;https://dms.licdn.com/.../mp4-720p-.../...&quot;,&quot;type&quot;:&quot;video/mp4&quot;,&quot;data-bitrate&quot;:762513}]"
+ * This is the primary, most reliable source — confirmed against a real
+ * post. Note the URLs don't necessarily end in a literal ".mp4" extension
+ * (they're path segments like "mp4-720p-30fp-crf28"), so don't rely on a
+ * ".mp4" suffix check alone; use the "type" field.
+ */
+function extractFromVideoDataSources(html: string): ExtractedVideo | null {
+  const videoTagPattern = /<video\b[^>]*\bdata-sources=(["'])([\s\S]*?)\1/gi;
+  let tagMatch: RegExpExecArray | null;
+
+  while ((tagMatch = videoTagPattern.exec(html)) !== null) {
+    let sources: VideoSource[];
+    try {
+      sources = JSON.parse(decodeHtmlEntities(tagMatch[2]));
+    } catch {
+      continue;
+    }
+
+    if (!Array.isArray(sources)) continue;
+
+    const withUrls = sources.filter(
+      (s): s is VideoSource & { src: string } => typeof s?.src === "string"
+    );
+    if (withUrls.length === 0) continue;
+
+    const mp4Sources = withUrls.filter(
+      (s) => (s.type ?? "").includes("mp4") || classify(s.src) === "mp4"
+    );
+    const pool = mp4Sources.length > 0 ? mp4Sources : withUrls;
+
+    // Prefer the highest-bitrate rendition.
+    const best = pool.reduce((a, b) =>
+      (b["data-bitrate"] ?? 0) > (a["data-bitrate"] ?? 0) ? b : a
+    );
+
+    const url = decodeHtmlEntities(best.src);
+    return { videoUrl: url, type: classify(url) };
+  }
+
+  return null;
+}
+
+/**
+ * Strategy 2: standard OpenGraph video meta tags. LinkedIn sometimes
  * renders these for public video posts, similar to most sites that support
  * link unfurling.
  */
@@ -72,7 +125,7 @@ function extractFromOgTags(html: string): ExtractedVideo | null {
 }
 
 /**
- * Strategy 2: LinkedIn server-renders page state as JSON inside
+ * Strategy 3: LinkedIn server-renders page state as JSON inside
  * <code style="display: none" id="...datastore-state..."> blocks that get
  * picked up client-side. Video posts carry a media object with fields like
  * "progressiveStreams" (MP4 renditions) or "streamingLocations" (HLS).
@@ -143,7 +196,7 @@ function looksLikeVideoUrl(value: string): boolean {
 }
 
 /**
- * Strategy 3: last resort — regex-scan the raw HTML for any URL that looks
+ * Strategy 4: last resort — regex-scan the raw HTML for any URL that looks
  * like a direct mp4 or m3u8 link, in case the video source is embedded
  * somewhere we don't otherwise parse (inline script, data attribute, etc.).
  */
